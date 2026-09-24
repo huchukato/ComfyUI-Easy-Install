@@ -265,11 +265,46 @@ EOL
         chmod +x python3
     }
 
+    # Bootstrap uv early: it creates venvs (with pip seeded) without needing
+    # ensurepip, and can fetch a standalone Python 3.12 when none is installed
+    # (typical for slim Docker images where python3.12-venv is missing).
+    ensure_uv() {
+        if command -v uv >/dev/null 2>&1; then
+            return 0
+        fi
+        echo "Installing uv standalone binary..."
+        if curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; then
+            for d in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+                [ -x "$d/uv" ] && PATH="$d:$PATH"
+            done
+            export PATH
+        fi
+        command -v uv >/dev/null 2>&1
+    }
+
     BASE_PYTHON312="$(find_python312 || true)"
     if [ -n "$BASE_PYTHON312" ]; then
         echo -e "${GREEN}Using existing Python 3.12 for a local venv:${RESET} $BASE_PYTHON312"
         if ! "$BASE_PYTHON312" -m venv .; then
-            echo -e "${RED}Failed to create Python 3.12 virtual environment${RESET}"
+            # Debian/Ubuntu python3.12 lacks ensurepip unless python3.12-venv is
+            # installed; uv builds the venv and seeds pip itself.
+            echo -e "${YELLOW}venv failed (ensurepip missing?) — retrying via uv${RESET}"
+            rm -rf bin include lib lib64 pyvenv.cfg .venv 2>/dev/null || true
+            if ensure_uv && uv venv --python "$BASE_PYTHON312" --seed --clear .; then
+                :
+            else
+                echo -e "${RED}Failed to create Python 3.12 virtual environment${RESET}"
+                exit 1
+            fi
+        fi
+        create_python_wrappers
+        PYTHON_CMD="$(pwd)/python"
+    elif ensure_uv; then
+        # No system Python 3.12 at all: let uv download a standalone managed
+        # build instead of compiling from source (much faster in Docker).
+        echo -e "${YELLOW}No system Python 3.12; creating venv via uv managed Python${RESET}"
+        if ! uv venv --python 3.12 --seed --clear .; then
+            echo -e "${RED}uv venv failed${RESET}"
             exit 1
         fi
         create_python_wrappers
@@ -531,18 +566,21 @@ EOL
     
     # Install llama-cpp-python (platform-specific) - JamePeng's fork
     if [ "$(uname)" = "Darwin" ]; then
-        # macOS version - install from source with Metal support
-        echo -e "${YELLOW}Installing llama-cpp-python v0.3.40 with Metal support for macOS...${RESET}"
-        CMAKE_ARGS="-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_APPLE_SILICON_PROCESSOR=arm64 -DGGML_METAL=on" uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS
+        # macOS version - prebuilt Metal wheel (Apple Silicon, Python 3.12)
+        echo -e "${YELLOW}Installing llama-cpp-python v0.4.0 Metal wheel for macOS...${RESET}"
+        uv pip install https://github.com/JamePeng/llama-cpp-python/releases/download/v0.4.0-Metal-macos-20260919/llama_cpp_python-0.4.0-cp312-cp312-macosx_11_0_arm64.whl $UV_ARGS || {
+            # Fallback: build from source with Metal support
+            echo -e "${YELLOW}Metal wheel failed; falling back to source build...${RESET}"
+            CMAKE_ARGS="-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_APPLE_SILICON_PROCESSOR=arm64 -DGGML_METAL=on" uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS
+        }
     else
         # Linux version - try different CUDA versions
-        # Note: JamePeng v0.3.40 has no cu130 Linux build; cu128 is the closest
-        echo -e "${YELLOW}Installing llama-cpp-python v0.3.40 with CUDA support for Linux...${RESET}"
-        
-        # Try CUDA 12.8 first (no cu130 Linux build for v0.3.40)
-        uv pip install https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.40-cu128-linux-20260607/llama_cpp_python-0.3.40+cu128-cp312-cp312-linux_x86_64.whl $UV_ARGS || {
+        echo -e "${YELLOW}Installing llama-cpp-python v0.4.0 with CUDA support for Linux...${RESET}"
+
+        # Try CUDA 12.8 first (widest compatibility with current images)
+        uv pip install https://github.com/JamePeng/llama-cpp-python/releases/download/v0.4.0-cu128-linux-20260919/llama_cpp_python-0.4.0+cu128-cp312-cp312-linux_x86_64.whl $UV_ARGS || {
             # Fallback to CUDA 12.6
-            uv pip install https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.40-cu126-linux-20260607/llama_cpp_python-0.3.40+cu126-cp312-cp312-linux_x86_64.whl $UV_ARGS || {
+            uv pip install https://github.com/JamePeng/llama-cpp-python/releases/download/v0.4.0-cu126-linux-20260919/llama_cpp_python-0.4.0+cu126-cp312-cp312-linux_x86_64.whl $UV_ARGS || {
                 # Final fallback to source build
                 echo -e "${YELLOW}Falling back to source build with CUDA...${RESET}"
                 CMAKE_ARGS="-DGGML_CUDA=on" uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS || {
@@ -788,7 +826,10 @@ get_node https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite comfyui-videohe
 get_node https://github.com/shiimizu/ComfyUI-TiledDiffusion ComfyUI-TiledDiffusion
 get_node https://github.com/kijai/ComfyUI-KJNodes comfyui-kjnodes
 get_node https://github.com/kijai/ComfyUI-WanVideoWrapper ComfyUI-WanVideoWrapper
-get_node https://github.com/1038lab/ComfyUI-QwenVL ComfyUI-QwenVL
+get_node https://github.com/huchukato/ComfyUI-QwenVL-Mod ComfyUI-QwenVL-Mod
+get_node https://github.com/huchukato/ComfyUI-TagForge ComfyUI-TagForge
+get_node https://github.com/huchukato/ComfyUI-HuggingFace ComfyUI-HuggingFace
+get_node https://github.com/huchukato/ComfyUI-PerfectVideoResolution ComfyUI-PerfectVideoResolution
 get_node https://github.com/flybirdxx/ComfyUI-Qwen-TTS qwen3-tts-comfyui
 get_node https://github.com/Saganaki22/ComfyUI-FishAudioS2 ComfyUI-fish-audio-s2
 get_node https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler seedvr2_videoupscaler
